@@ -8,9 +8,6 @@ import numpy as np
 def get_intraday_data(
     intraday_ticker, start: pd.Timestamp, end: pd.Timestamp, interval="1m"
 ):
-    # Split the date range into chunks of 7 days
-    # start = pd.Timestamp(start_date)
-    # end = pd.Timestamp(end_date)
     date_ranges = [
         (start + pd.DateOffset(days=i), min(start + pd.DateOffset(days=i + 7), end))
         for i in range(0, (end - start).days, 7)
@@ -97,3 +94,6 @@ expected_loss_per_loss = daily_ret[daily_ret < 0].mean()  # per $1 invested
 print(f"Hit rate: {hit_rate:.2%}")
 print(f"Expected gain per hit (per $1 invested): ${expected_gain_per_hit:.6f}")
 print(f"Expected loss per loss (per $1 invested): ${expected_loss_per_loss:.6f}")
+
+# It's important here to note that one of the reasons the hit rate and expected gain/loss per hit is low is due to the fact that we only have access to
+# about 2 months of 5-minute intraday data. With a longer history, we would be able to better estimate the weekly realized variance and thus improve the strategy's performance.
