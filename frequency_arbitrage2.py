@@ -27,7 +27,7 @@ def get_intraday_data(
 
 
 ticker = yf.Ticker("SPY")
-N = 10000  # Notional
+N = 1  # Notional
 
 # To comply with yfinance limitations, we fetch 5 min data in chunks of 7 days up to a max of 60 days
 end_date = pd.Timestamp.now()
