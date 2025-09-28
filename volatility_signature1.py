@@ -110,6 +110,7 @@ def get_intraday_data(intraday_ticker, start_date, end_date, interval="1m"):
     return intraday_data
 
 
+# Daily data from 2000-01-01 to present
 price_history = ticker.history(start="2000-01-01", interval="1d")
 
 # Remove timezone info for consistency
