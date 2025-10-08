@@ -12,8 +12,8 @@ from statsmodels.tsa.stattools import adfuller
 TICKERS = ["AAPL", "GOOG", "IBM", "SPY", "DIA"]
 YEARS = 10
 INSAMPLE_RATIO = 0.8
-PRIMARY, SECONDARY = "IBM", "SPY"
-ROLLING_WINDOW = 60  # ~3 months of trading days
+PAIRS = [("IBM", "SPY"), ("DIA", "SPY"), ("AAPL", "GOOG")]
+ROLLING_WINDOW = 60
 ENTRY_Z = 2.0
 EXIT_Z = 0.5
 
@@ -50,7 +50,7 @@ adj_close = pd.concat(
     axis=1,
     keys=TICKERS,
 ).dropna()
-# Flatten MultiIndex columns created by concat(keys=...) so each column is just the ticker
+
 if isinstance(adj_close.columns, pd.MultiIndex):
     adj_close.columns = adj_close.columns.get_level_values(0)
 
@@ -70,96 +70,106 @@ print(
     f"Out-of-sample (20%): {outsample.shape[0]} rows, {outsample.index[0].date()} -> {outsample.index[-1].date()}"
 )
 
-# Engle–Granger step for the primary pair (AAPL vs GOOG)
-if PRIMARY not in insample.columns or SECONDARY not in insample.columns:
-    raise KeyError("Primary/secondary tickers not present after alignment")
 
-y = insample[PRIMARY]
-x = add_constant(insample[SECONDARY])
-model = OLS(y, x).fit()
-hedge_ratio = model.params[SECONDARY]
-intercept = model.params["const"]
+def run_pair(primary: str, secondary: str) -> dict:
+    if primary not in insample.columns or secondary not in insample.columns:
+        raise KeyError("Primary/secondary tickers not present after alignment")
 
-spread_in = y - (hedge_ratio * insample[SECONDARY] + intercept)
-adf_stat, adf_pval, *_ = adfuller(spread_in)
+    y = insample[primary]
+    x = add_constant(insample[secondary])
+    model = OLS(y, x).fit()
+    beta = model.params[secondary]
+    intercept = model.params["const"]
 
-print(
-    f"OLS hedge ratio {PRIMARY}/{SECONDARY}: beta={hedge_ratio:.4f}, intercept={intercept:.4f}"
-)
-print(f"ADF test on in-sample spread: statistic={adf_stat:.3f}, p-value={adf_pval:.4f}")
+    spread_in = y - (beta * insample[secondary] + intercept)
+    adf_stat, adf_pval, *_ = adfuller(spread_in)
 
-# Construct spread and rolling z-scores for both in- and out-of-sample periods
-spread_out = outsample[PRIMARY] - (hedge_ratio * outsample[SECONDARY] + intercept)
-spread = pd.concat([spread_in, spread_out])
-rolling_mean = spread.rolling(ROLLING_WINDOW).mean()
-rolling_std = spread.rolling(ROLLING_WINDOW).std()
-zscore = (spread - rolling_mean) / rolling_std
+    spread_out = outsample[primary] - (beta * outsample[secondary] + intercept)
+    spread = pd.concat([spread_in, spread_out])
+    rolling_mean = spread.rolling(ROLLING_WINDOW).mean()
+    rolling_std = spread.rolling(ROLLING_WINDOW).std()
+    zscore = (spread - rolling_mean) / rolling_std
 
-print(
-    f"Rolling z-score (window={ROLLING_WINDOW}) available from {zscore.dropna().index[0].date()} onward"
-)
+    spread_lag = spread_in.shift(1).dropna()
+    spread_lag.name = "lag"
+    spread_ret_in = (spread_in - spread_in.shift(1)).dropna()
+    reg = OLS(spread_ret_in, add_constant(spread_lag)).fit()
+    phi = reg.params["lag"]
+    hl = None
+    if phi < 0:
+        hl = -np.log(2) / phi
 
-# Half-life estimation using the in-sample spread
-spread_lag = spread_in.shift(1).dropna()
-spread_lag.name = "lag"
-spread_ret_in = (spread_in - spread_in.shift(1)).dropna()
-reg = OLS(spread_ret_in, add_constant(spread_lag)).fit()
-phi = reg.params["lag"]
-if phi >= 0:
-    print(
-        "Warning: estimated mean-reversion speed is non-negative; half-life undefined"
-    )
-else:
-    half_life = -np.log(2) / phi
-    print(f"Estimated half-life: {half_life:.2f} days")
+    signal = pd.Series(0, index=zscore.index, dtype="int8")
+    position = 0
 
-# Generate trading signals based on z-score thresholds
-signal = pd.Series(0, index=zscore.index, dtype="int8")
-position = 0
+    for idx, z_val in zip(zscore.index, zscore.to_numpy()):
+        z_val = float(z_val) if not np.isnan(z_val) else np.nan
+        if np.isnan(z_val):
+            signal.at[idx] = position
+            continue
 
-for idx, z_val in zip(zscore.index, zscore.to_numpy()):
-    z_val = float(z_val) if not np.isnan(z_val) else np.nan
-    if np.isnan(z_val):
+        if position == 0:
+            if z_val > ENTRY_Z:
+                position = -1
+            elif z_val < -ENTRY_Z:
+                position = 1
+        elif abs(z_val) < EXIT_Z:
+            position = 0
+
         signal.at[idx] = position
-        continue
 
-    if position == 0:
-        if z_val > ENTRY_Z:
-            position = -1
-        elif z_val < -ENTRY_Z:
-            position = 1
-    elif abs(z_val) < EXIT_Z:
-        position = 0
+    trades_opened = int((signal.diff().abs() == 1).sum())
 
-    signal.at[idx] = position
+    spread_ret = spread.diff()
+    strategy_ret = (signal.shift(1) * spread_ret).dropna()
 
+    cum_pnl_full = strategy_ret.cumsum().iloc[-1]
+
+    split_date = outsample.index[0]
+    oos_ret = strategy_ret.loc[split_date:]
+
+    cum_pnl_oos = oos_ret.cumsum().iloc[-1] if not oos_ret.empty else None
+
+    return {
+        "pair": (primary, secondary),
+        "beta": beta,
+        "intercept": intercept,
+        "adf_stat": float(adf_stat),
+        "adf_pval": float(adf_pval),
+        "half_life": float(hl) if hl is not None else None,
+        "trades_opened": trades_opened,
+        "cum_pnl_full": cum_pnl_full,
+        "cum_pnl_oos": cum_pnl_oos,
+    }
+
+
+print("\nRunning baseline diagnostics and backtests for selected pairs:")
+results = []
+for primary, secondary in PAIRS:
+    try:
+        res = run_pair(primary, secondary)
+        results.append(res)
+        print(
+            f"Pair {primary}/{secondary}: beta={res['beta']:.4f}, ADF stat={res['adf_stat']:.3f}, "
+            f"p-val={res['adf_pval']:.4f}, half-life={res['half_life']}, trades={res['trades_opened']}, "
+            f"cum pnl full={res['cum_pnl_full']:.2f}, cum pnl oos={res['cum_pnl_oos']}"
+        )
+    except Exception as e:
+        print(f"Failed for pair {primary}/{secondary}: {e}")
+
+print("\nSummary table:")
 print(
-    "Signal counts (full sample): "
-    + ", ".join(
-        f"{state}:{count}"
-        for state, count in signal.value_counts().sort_index().items()
-    )
+    pd.DataFrame(results)[
+        [
+            "pair",
+            "beta",
+            "intercept",
+            "adf_stat",
+            "adf_pval",
+            "half_life",
+            "trades_opened",
+            "cum_pnl_full",
+            "cum_pnl_oos",
+        ]
+    ]
 )
-
-# Strategy returns in spread units (no costs)
-spread_ret = spread.diff()
-strategy_ret = (signal.shift(1) * spread_ret).dropna()
-
-cum_pnl = strategy_ret.cumsum()
-print(f"Full-sample cumulative spread PnL: {cum_pnl.iloc[-1]:.2f} (spread units)")
-
-# Out-of-sample slice diagnostics
-split_date = outsample.index[0]
-oos_signal = signal.loc[split_date:]
-oos_ret = strategy_ret.loc[split_date:]
-
-if not oos_ret.empty:
-    oos_cum = oos_ret.cumsum()
-    print(f"Out-of-sample cumulative spread PnL: {oos_cum.iloc[-1]:.2f} (spread units)")
-    print(f"Out-of-sample trading days active: {int((oos_signal != 0).sum())}")
-else:
-    print("No out-of-sample returns available; check signal alignment.")
-
-# Trade count summary
-trade_count = int((signal.diff().abs() == 1).sum())
-print(f"Trades opened (full sample): {trade_count}")
