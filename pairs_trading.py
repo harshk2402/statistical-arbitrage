@@ -1,5 +1,3 @@
-"""Data preparation and initial cointegration diagnostics for the pairs trading assignment."""
-
 from datetime import date, timedelta
 from typing import Dict
 
